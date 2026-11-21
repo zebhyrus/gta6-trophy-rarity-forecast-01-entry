@@ -1,346 +1,238 @@
-"""Forecast GTA VI trophy earn rates on Exophase at a case's target.
+"""Forecast Grand Theft Auto VI trophy earn rates on Exophase.
 
-Model: earners and tracked players are modelled separately, then divided.
+A trophy's rate is two counts divided: the players who earned it over the
+players Exophase tracks for the game. The two counts move for different
+reasons, so this program forecasts them apart and divides at the target.
 
-A trophy's Exophase rate is earners / players-tracked.  Early on the
-tracked pool grows much faster than any trophy's earners (launch night:
-638 tracked; first refresh: 3,868; by the afternoon of launch day the
-live page showed most rates down 5-20x), so a rate is not a smooth curve
-of its own: it is the ratio of two growing counts.  Each count is fitted
-in log time since release, x = ln(1 + hours since 2026-11-19T00:00Z):
+The tracked pool explodes after launch as the audience piles in, while a
+trophy's earners grow only as players reach that trophy. Launch night
+showed the split starkly: 638 players tracked, then a first refresh to
+3,868, and by the next afternoon the live page had most rates down
+5-20x while a few early trophies (Chapter 1, the fishing challenge, the
+arcade) had their earners grow tenfold or more. So:
 
-  * log players-tracked is linear in x (a power law in 1 + t);
-  * log earners per trophy is linear in x, shrunk toward its tier's
-    mean slope, then extrapolated with a damped step in x so growth
-    bends down over a multi-day horizon instead of running away.
+- Both counts are fitted in log time since release, x = ln(1 + hours),
+  on the distinct page states in the history. A page that Exophase has
+  not refreshed repeats for hours, so the history is collapsed to one
+  row per distinct state, anchored at the first read that showed it:
+  the state predates that read, and anchoring at the last read would
+  understate how long the counts had to grow.
+- Tracked players get a log-time slope from the recent states (the last
+  day's worth, or all of them when there are fewer), blended with the
+  slope of the last two states. With a single state there is no slope
+  to fit, so a prior slope of 1.3 stands in: the launch-week audience
+  grows roughly that fast in log time.
+- Each trophy's earners get their own log-time slope. When the history
+  has enough states the slope is fitted per trophy on the recent
+  states; otherwise it comes from a prior that reads the trophy's last
+  rate: trophies the launch-night cohort earned more are the early,
+  easy ones, and their earners keep growing fastest. The prior is
+  0.3 + 0.56 * (ln rate - mean ln rate), clipped to [0, 2].
+- Both extrapolations are damped over the horizon, dividing the slope
+  by (1 + horizon_days / 4): growth bends down over days instead of
+  running away, and tracked growth is capped at 60x the last count.
+  A trophy near 100% stays near 100%: its earners are the pool itself.
+- The spread is honest about how far ahead the forecast looks:
+  sigma = sqrt(0.3^2 + (0.35 * sqrt(horizon_days))^2) on the logit
+  scale, about 0.4 at half a day and about 0.94 at six and a half days.
 
-Quantiles are honest about the refresh shocks: the spread combines the
-fit residuals, a random-walk term in the horizon, and a shock term that
-is large when the history has never shown a refresh (one distinct
-snapshot) and fades as the horizon lengthens.
-
-Standard library only.  Deterministic: no randomness, no clock, no
-network; the same case always writes the same bytes.
+Python 3.13 standard library only, no network, deterministic: two runs
+on the same case write the same bytes.
 """
 
 import json
 import math
 import os
-import sys
 from datetime import datetime, timezone
 from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 INPUT_DIR = Path(os.environ.get("MAKEFUN_INPUT_DIR", "/input"))
 OUTPUT_DIR = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
 
-RELEASE = datetime(2026, 11, 19, 0, 0, 0, tzinfo=timezone.utc)
+RELEASE = datetime(2026, 11, 19, tzinfo=timezone.utc)
+LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
+Z_SCORES = [-1.645, -0.674, 0.0, 0.674, 1.645]
 
-# Normal quantiles for the scored levels; any other level is computed.
-Z_TABLE = {0.05: -1.6448536269514722, 0.25: -0.6744897501960817,
-           0.5: 0.0, 0.75: 0.6744897501960817, 0.95: 1.6448536269514722}
+# Tuned on a real out-of-sample check: fit only on launch-night reads,
+# predict the live Exophase page ~13 hours later (see README).
+TRACKED_PRIOR_SLOPE = 1.3
+DAMPING_DAYS = 4.0
+MAX_TRACKED_GROWTH = 60.0
+EARNER_BASE_SLOPE = 0.3
+EARNER_RATE_SLOPE = 0.56
+EARNER_SLOPE_MIN = 0.0
+EARNER_SLOPE_MAX = 2.0
+FIT_WINDOW_HOURS = 24.0
+SPREAD_BASE = 0.3
+SPREAD_PER_ROOT_DAY = 0.35
+SPREAD_UNIVERSAL = 0.15
 
-# Fallback slope of log tracked-players against log time when the
-# history shows no growth at all (one distinct snapshot).  The first
-# refresh took tracked players 638 -> 3,868 in about 4.5 hours, and the
-# live page by launch afternoon implied tens of thousands: a slope near
-# 1.5 in log time fits that early climb.
-PRIOR_TRACKED_SLOPE = 1.5
-# Earners grow slower than the tracked pool on average (dilution), and
-# a trophy with no readable history is assumed to grow at this share
-# of the tracked slope.
-PRIOR_EARNER_SHARE = 0.7
 
-
-def parse_time(text):
-    """ISO 8601 timestamp -> aware datetime (accepts a trailing Z)."""
+def _when(text):
     return datetime.fromisoformat(text.replace("Z", "+00:00"))
 
 
-def hours_since_release(when):
-    """Hours from release to `when`, floored at 0 (pre-release reads)."""
-    return max(0.0, (when - RELEASE).total_seconds() / 3600.0)
+def _log_clock(moment):
+    """Log time since release: ln(1 + hours), floored at release."""
+    hours = (moment - RELEASE).total_seconds() / 3600.0
+    return math.log1p(max(hours, 0.0))
 
 
-def log_time(when):
-    """Log-time coordinate: ln(1 + hours since release)."""
-    return math.log1p(hours_since_release(when))
+def _least_squares(xs, ys):
+    """Return (intercept, slope) of the least-squares line through the points."""
+    n = len(xs)
+    mean_x = sum(xs) / n
+    mean_y = sum(ys) / n
+    spread_xx = sum((x - mean_x) ** 2 for x in xs)
+    if spread_xx == 0:
+        return mean_y, 0.0
+    slope = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys)) / spread_xx
+    return mean_y - slope * mean_x, slope
 
 
-def clamp_rate(pct):
-    return min(99.99, max(0.01, pct))
-
-
-def logit(pct):
-    p = clamp_rate(pct) / 100.0
+def _logit(pct):
+    p = min(99.99, max(0.01, pct)) / 100.0
     return math.log(p / (1.0 - p))
 
 
-def sigmoid(lg):
-    if lg >= 0:
-        return 1.0 / (1.0 + math.exp(-lg))
-    e = math.exp(lg)
-    return e / (1.0 + e)
+def _pct(logit_value):
+    return 100.0 / (1.0 + math.exp(-logit_value))
 
 
-def round4(x):
-    """Round to 4 decimals, half up; whole numbers come back as ints."""
-    scaled = x * 10000.0
-    whole = math.floor(scaled)
-    if scaled - whole >= 0.5:
-        whole += 1
-    value = whole / 10000.0
-    return int(value) if value == int(value) else value
+def _round4(value):
+    """Round to 4 decimals, half up, as a plain number (100 stays 100)."""
+    scaled = value * 10000.0
+    whole = math.floor(scaled + 0.5)
+    rounded = whole / 10000.0
+    return int(rounded) if rounded.is_integer() else rounded
 
 
-def norm_ppf(p):
-    """Standard normal quantile (Acklam's rational approximation)."""
-    if p in Z_TABLE:
-        return Z_TABLE[p]
-    if p <= 0.0:
-        return -8.0
-    if p >= 1.0:
-        return 8.0
-    a = [-3.969683028665376e+01, 2.209460984245205e+02,
-         -2.759285104469687e+02, 1.383577518672690e+02,
-         -3.066479806614716e+01, 2.506628277459239e+00]
-    b = [-5.447609879822406e+01, 1.615858368580409e+02,
-         -1.556989798598866e+02, 6.680131188771972e+01,
-         -1.328068155288572e+01]
-    c = [-7.784894002430293e-03, -3.223964580411365e-01,
-         -2.400758277161838e+00, -2.549732539343734e+00,
-         4.374664141464968e+00, 2.938163982698783e+00]
-    d = [7.784695709041462e-03, 3.224671290700398e-01,
-         2.445134137142996e+00, 3.754408661907416e+00]
-    plow, phigh = 0.02425, 1.0 - 0.02425
-    if p < plow:
-        q = math.sqrt(-2.0 * math.log(p))
-        return (((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5]) / \
-            ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1.0)
-    if p > phigh:
-        q = math.sqrt(-2.0 * math.log(1.0 - p))
-        return -(((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5]) / \
-            ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1.0)
-    q = p - 0.5
-    r = q * q
-    return (((((a[0] * r + a[1]) * r + a[2]) * r + a[3]) * r + a[4]) * r + a[5]) * q / \
-        (((((b[0] * r + b[1]) * r + b[2]) * r + b[3]) * r + b[4]) * r + 1.0)
+def _states(case):
+    """Collapse the history to one row per distinct page state.
 
-
-def ols(xs, ys):
-    """Least-squares line y = a + b*x; returns (a, b, residual_std)."""
-    n = len(xs)
-    mx = sum(xs) / n
-    my = sum(ys) / n
-    sxx = sum((x - mx) ** 2 for x in xs)
-    if sxx <= 1e-12:
-        return my, 0.0, 0.0
-    b = sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / sxx
-    a = my - b * mx
-    if n > 2:
-        resid = math.sqrt(sum((y - (a + b * x)) ** 2
-                              for x, y in zip(xs, ys)) / (n - 2))
-    else:
-        resid = 0.0
-    return a, b, resid
-
-
-def distinct_snapshots(case):
-    """History collapsed to one row per distinct page state.
-
-    Exophase refreshes on its own schedule, so reads repeat the same
-    page for hours; only a change in players-tracked or any rate is a
-    new observation.  Each row is (log-time, players-tracked, rates).
+    Returns a list of (players_tracked, rates tuple, first_seen), oldest
+    first. A state is anchored at the first read that showed it, because
+    Exophase refreshed the page before that read, not after the last
+    read that repeated it.
     """
     rows = []
-    seen = None
-    n_tr = len(case.get("trophies", []))
-    for read in case.get("history", []):
-        rates = list(read.get("rates") or ())
-        if len(rates) < n_tr:
-            rates += [None] * (n_tr - len(rates))
-        key = (read.get("players_tracked"), tuple(rates))
-        when = log_time(parse_time(read["at"]))
-        if key == seen:
-            # Same page again: the state is now known to persist until
-            # this read, so anchor it at the latest time it was seen.
-            rows[-1] = (when, rows[-1][1], rows[-1][2])
+    for read in case["history"]:
+        key = (read["players_tracked"], tuple(read["rates"]))
+        if rows and rows[-1][0] == key:
             continue
-        seen = key
-        rows.append((when, read["players_tracked"], rates))
-    return rows
+        rows.append((key, _when(read["at"])))
+    return [(key[0], key[1], seen) for key, seen in rows]
 
 
-def damped_step(dx):
-    """A step in log time, bent down for far targets: growth saturates."""
-    return dx / (1.0 + 0.35 * dx) if dx > 0 else 0.0
+def _recent(rows):
+    """Indexes of the states inside the fitting window before the last one."""
+    last_seen = rows[-1][2]
+    keep = [j for j, (_, _, seen) in enumerate(rows)
+            if (last_seen - seen).total_seconds() / 3600.0 <= FIT_WINDOW_HOURS]
+    if len(keep) < 2:
+        return list(range(len(rows)))
+    return keep
 
 
-def fit_tracked(rows, x_target):
-    """Forecast players-tracked at x_target; returns (n_target, slope).
-
-    Anchored at the last read and extrapolated with the same damped
-    step the earner fits use, so a trophy whose earners track the pool
-    keeps its rate instead of diluting away.
-    """
-    last_n = rows[-1][1]
-    x_last = rows[-1][0]
-    step = damped_step(max(0.0, x_target - x_last))
-    if len(rows) < 2:
-        slope = PRIOR_TRACKED_SLOPE
-        log_n = math.log(max(1.0, last_n)) + slope * step
-        return min(max(math.exp(log_n), last_n), last_n * 500.0), slope
-    xs = [r[0] for r in rows]
-    ys = [math.log(max(1.0, r[1])) for r in rows]
-    _, b, _ = ols(xs, ys)
-    if b <= 0.0:
-        b = PRIOR_TRACKED_SLOPE
-    log_n = math.log(max(1.0, last_n)) + b * step
-    n_target = math.exp(log_n)
-    return min(max(n_target, last_n), last_n * 500.0), b
-
-
-def fit_earners(rows, trophies, x_target, tracked_slope):
-    """Per-trophy earner forecasts.
-
-    Returns a list, one per trophy, of (earners_target, sigma_fit):
-    earners fitted as log-linear in log time, shrunk toward the tier
-    mean slope, extrapolated with a damped step so multi-day growth
-    bends down, and floored at the last observed earners (earners
-    never decrease).  sigma_fit is the fit's residual scale.
-    """
-    n_tr = len(trophies)
-    last = rows[-1]
-    last_n = max(1.0, last[1])
-    # Earners per trophy at each distinct snapshot.
-    earners = []
-    for r in rows:
-        n = max(1.0, r[1])
-        earners.append([max(0.5, (rate if rate is not None else 0.0) * n / 100.0)
-                        for rate in r[2]])
-    xs = [r[0] for r in rows]
-    x_last = xs[-1]
-    dx = max(0.0, x_target - x_last)
-    # Damped extrapolation step: growth in log time saturates, so a
-    # far target moves less per unit of log time than a near one.
-    # The tracked-players fit uses the same step, so ratios stay put
-    # for trophies whose earners track the pool.
-    dx_eff = damped_step(dx)
-
-    raw = []  # (slope, intercept, resid, last_earners) per trophy
-    for i in range(n_tr):
-        ys = [math.log(e[i]) for e in earners]
-        if len(rows) >= 3:
-            a, b, resid = ols(xs, ys)
-        else:
-            a, b, resid = ys[-1] - tracked_slope * PRIOR_EARNER_SHARE * x_last, \
-                tracked_slope * PRIOR_EARNER_SHARE, 0.0
-        raw.append((a, b, resid, earners[-1][i]))
-
-    # Tier mean slopes from the trophies that had a real fit.
-    tier_slopes = {}
-    for tier in {t.get("tier") for t in trophies}:
-        fitted = [raw[i][1] for i, t in enumerate(trophies)
-                  if t.get("tier") == tier and len(rows) >= 3]
-        if fitted:
-            tier_slopes[tier] = sum(fitted) / len(fitted)
-    global_slope = tracked_slope * PRIOR_EARNER_SHARE
-    if len(rows) >= 3:
-        fitted_all = [raw[i][1] for i in range(n_tr)]
-        global_slope = sum(fitted_all) / len(fitted_all)
-
-    out = []
-    for i, trophy in enumerate(trophies):
-        a, b, resid, e_last = raw[i]
-        tier_mean = tier_slopes.get(trophy.get("tier"), global_slope)
-        # A trophy nearly everyone has earned (rate near 100%) can only
-        # grow with the tracked pool itself: its earners track N, so its
-        # slope floor rises with its last rate toward the tracked slope.
-        last_rate = last[2][i] if last[2][i] is not None else 0.0
-        share_floor = 0.7 + 0.3 * (min(100.0, last_rate) / 100.0) ** 2
-        slope_floor = tracked_slope * share_floor
-        if len(rows) >= 3:
-            w = len(rows) / (len(rows) + 4.0)
-            slope = w * b + (1.0 - w) * tier_mean
-            slope = max(slope, slope_floor)
-            # Re-anchor at the last observation so shrinkage moves the
-            # slope, never the level the history actually ends at.
-            log_e = math.log(e_last) + slope * dx_eff
-            sig = min(max(resid, 0.15), 1.2)
-        else:
-            slope = max(tier_mean if tier_mean is not None else global_slope,
-                        slope_floor)
-            log_e = math.log(e_last) + slope * dx_eff
-            sig = 0.6
-        e_target = max(math.exp(log_e), e_last)
-        out.append((e_target, sig))
-    return out
-
-
-def forecast_case(case):
-    """One case -> {"trophies": [{"id": n, "q": [...]}, ...]}."""
-    trophies = case["trophies"]
-    levels = case.get("levels") or [0.05, 0.25, 0.5, 0.75, 0.95]
-    target = parse_time(case["target"])
-    x_target = log_time(target)
-    horizon_days = max(0.0, case.get("horizon_minutes", 0) / 1440.0)
-    rows = distinct_snapshots(case)
-    if not rows:
-        return {"trophies": [{"id": t["id"], "q": [0.05, 0.2, 0.5, 1.2, 3.0]}
-                             for t in trophies]}
-
-    n_target, tracked_slope = fit_tracked(rows, x_target)
-    jump = 1.0
-    if len(rows) <= 1:
-        # No refresh has ever been seen: the next one is a step jump in
-        # the tracked pool, not smooth growth (launch night's first
-        # refresh took it 638 -> 3,868, about 6x including the smooth
-        # climb).  Expect such a jump soon after release; the
-        # expectation fades over days, when growth turns smooth.
-        jump = 1.0 + 3.0 * math.exp(-horizon_days / 1.0)
-        n_target = min(n_target * jump, rows[-1][1] * 50.0)
-    earner_rows = fit_earners(rows, trophies, x_target, tracked_slope)
-
-    # Refresh-shock term: when the history has never shown a refresh,
-    # the next one can move every rate at once (the practice cases are
-    # exactly this: one page, then a refresh).  It bites on short
-    # horizons and fades over days, when refreshes average out.
-    if len(rows) <= 1:
-        shock = 0.85 * math.exp(-horizon_days / 2.0)
-    elif len(rows) <= 3:
-        shock = 0.4 * math.exp(-horizon_days / 2.0)
+def _tracked_at_target(rows, clocks, x_target, horizon_days):
+    """Forecast the players-tracked count at the target's log time."""
+    players_last = max(rows[-1][0], 1)
+    keep = _recent(rows)
+    if len(keep) >= 2:
+        xs = [clocks[j] for j in keep]
+        ys = [math.log(max(rows[j][0], 1)) for j in keep]
+        _, slope_all = _least_squares(xs, ys)
+        _, slope_recent = _least_squares(xs[-2:], ys[-2:])
+        slope = 0.5 * slope_all + 0.5 * slope_recent
     else:
-        shock = 0.15 * math.exp(-horizon_days / 2.0)
-    walk = 0.30 * math.sqrt(horizon_days)
+        slope = TRACKED_PRIOR_SLOPE
+    slope = max(slope, 0.0)
+    damp = 1.0 / (1.0 + horizon_days / DAMPING_DAYS)
+    grown = slope * damp * max(x_target - clocks[-1], 0.0)
+    grown = min(grown, math.log(MAX_TRACKED_GROWTH))
+    return players_last * math.exp(grown)
 
+
+def _earner_slopes(rows, clocks, last_rates):
+    """One log-time slope per trophy for how its earners grow.
+
+    Fitted per trophy on the recent states when the history has enough
+    of them; otherwise the rate prior: early, common trophies grow
+    fastest, rare late ones barely move.
+    """
+    count = len(last_rates)
+    log_rates = [math.log(max(rate, 0.01)) for rate in last_rates]
+    mean_log_rate = sum(log_rates) / count
+    prior = []
+    for log_rate in log_rates:
+        slope = EARNER_BASE_SLOPE + EARNER_RATE_SLOPE * (log_rate - mean_log_rate)
+        prior.append(min(max(slope, EARNER_SLOPE_MIN), EARNER_SLOPE_MAX))
+    keep = _recent(rows)
+    if len(keep) < 2:
+        return prior
+    fitted = {}
+    for i in range(count):
+        points = []
+        usable = True
+        for j in keep:
+            rate = rows[j][1][i]
+            if rate is None:
+                usable = False
+                break
+            earners = max(rate / 100.0 * max(rows[j][0], 1), 0.5)
+            points.append(math.log(earners))
+        if usable:
+            _, slope = _least_squares([clocks[j] for j in keep], points)
+            fitted[i] = min(max(slope, EARNER_SLOPE_MIN), EARNER_SLOPE_MAX)
+    return [fitted.get(i, prior[i]) for i in range(count)]
+
+
+def _last_known_rates(rows, count):
+    """Each trophy's rate in the newest state that lists it."""
+    found = [None] * count
+    for _, rates, _ in reversed(rows):
+        for i, rate in enumerate(rates):
+            if found[i] is None and rate is not None:
+                found[i] = rate
+        if all(rate is not None for rate in found):
+            break
+    return [rate if rate is not None else 0.0 for rate in found]
+
+
+def forecast_case(case, name):
+    if case["levels"] != LEVELS:
+        raise ValueError(f"{name} asks for levels {case['levels']}, not {LEVELS}")
+    if not case["history"]:
+        raise ValueError(f"{name} has no history")
+    rows = _states(case)
+    clocks = [_log_clock(seen) for _, _, seen in rows]
+    horizon_days = case["horizon_minutes"] / 1440.0
+    x_target = _log_clock(_when(case["target"]))
+    players_target = _tracked_at_target(rows, clocks, x_target, horizon_days)
+    players_last = max(rows[-1][0], 1)
+    trophies = case["trophies"]
+    last_rates = _last_known_rates(rows, len(trophies))
+    slopes = _earner_slopes(rows, clocks, last_rates)
+    damp = 1.0 / (1.0 + horizon_days / DAMPING_DAYS)
+    step = damp * max(x_target - clocks[-1], 0.0)
+    spread = math.sqrt(SPREAD_BASE ** 2
+                       + (SPREAD_PER_ROOT_DAY * math.sqrt(horizon_days)) ** 2)
     out_rows = []
-    last_rates = rows[-1][2]
-    for i, trophy in enumerate(trophies):
-        e_target, sig_fit = earner_rows[i]
-        if jump > 1.0:
-            # A refresh records earners too: a trophy nearly everyone
-            # has rides the jump with the pool, a rare one barely
-            # moves, so its earners take the jump to the power of the
-            # square root of its last rate.
-            last_rate = last_rates[i] if last_rates[i] is not None else 0.0
-            e_target *= jump ** math.sqrt(min(100.0, last_rate) / 100.0)
-        # Earners cannot exceed the tracked pool.
-        e_target = min(e_target, 0.999 * n_target)
-        median = clamp_rate(100.0 * e_target / n_target)
-        sigma = math.sqrt(sig_fit ** 2 + walk ** 2 + shock ** 2)
-        sigma = min(max(sigma, 0.25), 2.0)
-        centre = logit(median)
-        qs = []
-        prev = None
-        for level in levels:
-            q = clamp_rate(100.0 * sigmoid(centre + norm_ppf(level) * sigma))
-            q = round4(q)
-            if prev is not None and q < prev:
-                q = prev
-            qs.append(q)
-            prev = q
-        out_rows.append({"id": trophy["id"], "q": qs})
+    for trophy, rate_last, slope in zip(trophies, last_rates, slopes):
+        if rate_last >= 90.0:
+            # Near-universal trophies move with the pool: the rate stays put.
+            middle = min(rate_last, 99.99)
+            sigma = SPREAD_UNIVERSAL
+        else:
+            earners_last = max(rate_last / 100.0 * players_last, 0.5)
+            earners_target = earners_last * math.exp(slope * step)
+            middle = min(max(100.0 * earners_target / players_target, 0.01), 99.99)
+            sigma = spread
+        centre = _logit(middle)
+        quantiles = [_round4(min(max(_pct(centre + z * sigma), 0.0), 100.0))
+                     for z in Z_SCORES]
+        quantiles.sort()
+        out_rows.append({"id": trophy["id"], "q": quantiles})
     return {"trophies": out_rows}
 
 
@@ -348,9 +240,9 @@ def main():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     for path in sorted(INPUT_DIR.glob("*.in")):
         case = json.loads(path.read_text(encoding="utf-8"))
-        forecast = forecast_case(case)
+        forecast = forecast_case(case, path.name)
         text = json.dumps(forecast, separators=(",", ":")) + "\n"
-        (OUTPUT_DIR / (path.stem + ".out")).write_text(text, encoding="utf-8")
+        (OUTPUT_DIR / f"{path.stem}.out").write_text(text, encoding="utf-8")
 
 
 if __name__ == "__main__":
